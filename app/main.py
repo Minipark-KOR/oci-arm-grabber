@@ -150,7 +150,7 @@ def main():
             break
 
         except oci.exceptions.ServiceError as e:
-            if "Out of capacity" in str(e) or e.status == 429:
+            if "Out of" in str(e) or e.status == 429:
                 logger.warning(f"⚠️ 용량 부족 또는 제한: {e}")
                 time.sleep(wait_sec)
                 continue
