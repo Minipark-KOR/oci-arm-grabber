@@ -127,8 +127,9 @@ def main():
                 time.sleep(wait_sec)
                 continue
             else:
-                logger.error(f"❌ 치명적 OCI 오류: {e}")
-                sys.exit(1)
+                logger.error(f"❌ OCI 오류, 재시도: {e}")
+                time.sleep(wait_sec)
+                continue
         except Exception as e:
             logger.error(f"❌ 기타 오류: {e}, 재시도...")
             time.sleep(wait_sec)
