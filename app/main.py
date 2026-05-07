@@ -108,7 +108,7 @@ def main():
     instance_details = oci.core.models.LaunchInstanceDetails(
         compartment_id=compartment_id,
         availability_domain=availability_domain,
-        display_name="chuncheon-arm-instance",
+        display_name="devforge",
         shape="VM.Standard.A1.Flex",
         shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=1, memory_in_gbs=6),
         source_details=oci.core.models.InstanceSourceViaImageDetails(image_id=image_id, boot_volume_size_in_gbs=50),
