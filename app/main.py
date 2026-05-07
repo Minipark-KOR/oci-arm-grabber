@@ -7,6 +7,8 @@ import oci
 import sys
 import time
 import os
+import base64
+import tempfile
 import logging
 from datetime import datetime
 import pytz
@@ -59,7 +61,14 @@ def main():
     availability_domain = os.environ.get("OCI_AVAILABILITY_DOMAIN", "AP-CHUNCHEON-1-AD-1")
     image_id = os.environ.get("OCI_IMAGE_ID")
     ssh_public_key = os.environ.get("OCI_SSH_PUBLIC_KEY")
-    key_path = os.environ.get("OCI_KEY_PATH", "/root/.oci/oci_api_key.pem")
+    key_path = os.environ.get("OCI_KEY_PATH", "/tmp/oci_api_key.pem")
+
+    # OCI_KEY_CONTENT 환경 변수로 키 내용이 전달된 경우 파일로 저장
+    key_content = os.environ.get("OCI_KEY_CONTENT")
+    if key_content:
+        with open(key_path, "w") as f:
+            f.write(base64.b64decode(key_content).decode())
+        os.chmod(key_path, 0o600)
 
     if not all([compartment_id, subnet_id, image_id, ssh_public_key]):
         logger.error("필수 환경 변수가 누락되었습니다.")
