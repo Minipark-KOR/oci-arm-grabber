@@ -110,7 +110,7 @@ def main():
         availability_domain=availability_domain,
         display_name="devforge",
         shape="VM.Standard.A1.Flex",
-        shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=1, memory_in_gbs=6),
+        shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=4, memory_in_gbs=24),
         source_details=oci.core.models.InstanceSourceViaImageDetails(image_id=image_id, boot_volume_size_in_gbs=50),
         subnet_id=subnet_id,
         metadata={"ssh_authorized_keys": ssh_public_key}
@@ -147,7 +147,9 @@ def main():
                 logger.warning("⚠️ RUNNING 상태 도달 실패, 인스턴스를 종료합니다.")
                 compute_client.terminate_instance(instance_id)
                 send_email("[OCI ARM] 생성 실패 - RUNNING 미도달", f"인스턴스가 생성되었으나 RUNNING 상태에 도달하지 못해 종료했습니다.\n\nOCID: {instance_id}")
-            break
+            logger.info("작업 완료. 컨테이너 유지 중...")
+            while True:
+                time.sleep(3600)
 
         except oci.exceptions.ServiceError as e:
             if "Out of" in str(e) or e.status == 429:
