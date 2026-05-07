@@ -8,9 +8,10 @@ import sys
 import time
 import os
 import base64
-import tempfile
+import smtplib
 import logging
 from datetime import datetime
+from email.mime.text import MIMEText
 import pytz
 
 # 로깅 설정
@@ -19,6 +20,26 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def send_email(subject, body):
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    smtp_to = os.environ.get("SMTP_TO")
+    if not all([smtp_user, smtp_password, smtp_to]):
+        logger.info("SMTP 설정이 없어 이메일을 건너뜁니다.")
+        return
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = smtp_user
+        msg["To"] = smtp_to
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as s:
+            s.starttls()
+            s.login(smtp_user, smtp_password)
+            s.sendmail(smtp_user, [smtp_to], msg.as_string())
+        logger.info("이메일 발송 완료")
+    except Exception as e:
+        logger.error(f"이메일 발송 실패: {e}")
 
 def get_wait_seconds():
     """한국 시간 기준 새벽(0~5시) 30초, 낮 300초"""
@@ -111,14 +132,21 @@ def main():
             logger.info("⏳ RUNNING 상태 대기 중 (최대 5분)...")
             if wait_for_instance_running(compute_client, instance_id):
                 public_ip = get_public_ip(compute_client, compartment_id, instance_id)
+                ssh_cmd = ""
                 if public_ip:
+                    ssh_cmd = f"ssh -i /path/to/private_key opc@{public_ip}"
                     logger.info(f"\n🔗 인스턴스 접속 정보:")
-                    logger.info(f"ssh -i /path/to/private_key opc@{public_ip}")
+                    logger.info(ssh_cmd)
+                    body = f"OCI ARM 인스턴스 생성 성공!\n\nOCID: {instance_id}\nPublic IP: {public_ip}\nSSH: {ssh_cmd}"
+                    send_email("[OCI ARM] 인스턴스 생성 성공!", body)
                 else:
                     logger.warning("⚠️ 공인 IP를 찾을 수 없습니다.")
+                    body = f"OCI ARM 인스턴스 생성 성공!\n\nOCID: {instance_id}\n(공인 IP 없음)"
+                    send_email("[OCI ARM] 인스턴스 생성 성공 (IP 없음)", body)
             else:
                 logger.warning("⚠️ RUNNING 상태 도달 실패, 인스턴스를 종료합니다.")
                 compute_client.terminate_instance(instance_id)
+                send_email("[OCI ARM] 생성 실패 - RUNNING 미도달", f"인스턴스가 생성되었으나 RUNNING 상태에 도달하지 못해 종료했습니다.\n\nOCID: {instance_id}")
             break
 
         except oci.exceptions.ServiceError as e:
