@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  oci-arm-grabber:
+    build: .
+    container_name: oci-arm-grabber
+    restart: always
+    environment:
+      - OCI_USER_OCID=${OCI_USER_OCID}
+      - OCI_TENANCY_OCID=${OCI_TENANCY_OCID}
+      - OCI_FINGERPRINT=${OCI_FINGERPRINT}
+      - OCI_COMPARTMENT_ID=${OCI_COMPARTMENT_ID}
+      - OCI_SUBNET_ID=${OCI_SUBNET_ID}
+      - OCI_AVAILABILITY_DOMAIN=${OCI_AVAILABILITY_DOMAIN:-AP-CHUNCHEON-1-AD-1}
+      - OCI_IMAGE_ID=${OCI_IMAGE_ID}
+      - OCI_SSH_PUBLIC_KEY=${OCI_SSH_PUBLIC_KEY}
+    volumes:
+      - ~/.oci:/root/.oci:ro   # API key 파일 위치
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
