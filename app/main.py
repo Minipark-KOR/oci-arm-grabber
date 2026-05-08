@@ -413,13 +413,12 @@ def main():
         """종료되지 않은 인스턴스 (고아) 목록 반환"""
         client = oci.core.ComputeClient(config)
         try:
-            instances = client.list_instances(
-                compartment_id=compartment_id,
-                lifecycle_state="RUNNING,PROVISIONING,STARTING,STOPPING,STOPPED"
-            ).data
+            instances = client.list_instances(compartment_id=compartment_id).data
+            active_states = {"MOVING", "PROVISIONING", "RUNNING", "STARTING", "STOPPING", "STOPPED", "CREATING_IMAGE"}
             result = []
             for inst in instances:
-                result.append(f"  - {inst.id} [{inst.lifecycle_state}] {inst.display_name}")
+                if inst.lifecycle_state in active_states:
+                    result.append(f"  - {inst.id} [{inst.lifecycle_state}] {inst.display_name}")
             return result
         except Exception as e:
             logger.error(f"고아 확인 중 오류: {e}")
