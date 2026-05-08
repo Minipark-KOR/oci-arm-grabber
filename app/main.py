@@ -109,10 +109,13 @@ def resize_instance(compute_client, instance_id, target_ocpus, target_memory):
             )
         )
         compute_client.update_instance(instance_id, update_details)
-    except oci.exceptions.ServiceError as e:
+    except Exception as e:
         logger.error(f"형상 업데이트 실패: {e}")
-        compute_client.instance_action(instance_id, "START")
-        wait_for_state(compute_client, instance_id, ["RUNNING"], timeout=120)
+        try:
+            compute_client.instance_action(instance_id, "START")
+            wait_for_state(compute_client, instance_id, ["RUNNING"], timeout=120)
+        except Exception:
+            pass
         return False
 
     logger.info("  시작 요청...")
@@ -211,6 +214,7 @@ def main():
             with stats_lock:
                 stats["direct_attempts"] += 1
 
+            instance_id = None
             try:
                 response = client.launch_instance(details_direct)
                 instance_id = response.data.id
@@ -263,10 +267,20 @@ def main():
                     logger.warning(f"[직접] 용량 부족 또는 제한")
                 else:
                     logger.error(f"[직접] OCI 오류: {e}")
+                if instance_id:
+                    try:
+                        client.terminate_instance(instance_id)
+                    except Exception:
+                        pass
                 time.sleep(wait_sec)
                 continue
             except Exception as e:
                 logger.error(f"[직접] 기타 오류: {e}, 재시도...")
+                if instance_id:
+                    try:
+                        client.terminate_instance(instance_id)
+                    except Exception:
+                        pass
                 time.sleep(wait_sec)
                 continue
 
@@ -281,6 +295,7 @@ def main():
             now_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S')
             logger.info(f"[{now_str}] 🚀 [소형] 생성 시도 #{attempt} (다음 대기: {wait_sec}초)")
 
+            instance_id = None
             try:
                 response = client.launch_instance(details_small)
                 instance_id = response.data.id
@@ -377,10 +392,20 @@ def main():
                     logger.warning(f"[소형] 용량 부족 또는 제한")
                 else:
                     logger.error(f"[소형] OCI 오류: {e}")
+                if instance_id:
+                    try:
+                        client.terminate_instance(instance_id)
+                    except Exception:
+                        pass
                 time.sleep(wait_sec)
                 continue
             except Exception as e:
                 logger.error(f"[소형] 기타 오류: {e}, 재시도...")
+                if instance_id:
+                    try:
+                        client.terminate_instance(instance_id)
+                    except Exception:
+                        pass
                 time.sleep(wait_sec)
                 continue
 
