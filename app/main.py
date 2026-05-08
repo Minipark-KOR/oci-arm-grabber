@@ -64,13 +64,13 @@ def wait_for_instance_running(compute_client, instance_id, timeout=900, interval
         logger.info(f"  {entry}")
         last_state = state
         if state == "RUNNING":
-            logger.info("✅ 인스턴스 실행 중")
+            logger.info("[OK] 인스턴스 실행 중")
             return (True, state, state_log)
         elif state in ["TERMINATED", "TERMINATING"]:
-            logger.error(f"❌ 인스턴스가 {state} 상태로 전환됨")
+            logger.error(f"[FAIL] 인스턴스가 {state} 상태로 전환됨")
             return (False, state, state_log)
         time.sleep(interval)
-    logger.warning(f"⏰ 시간 초과 (15분): 최종 상태 = {last_state}")
+    logger.warning(f"[TIMEOUT] 시간 초과 (15분): 최종 상태 = {last_state}")
     return (False, last_state, state_log)
 
 def wait_for_state(compute_client, instance_id, target_states, timeout=300, interval=10):
@@ -84,15 +84,15 @@ def wait_for_state(compute_client, instance_id, target_states, timeout=300, inte
         if state in target_states:
             return True
         if state in ["TERMINATED", "TERMINATING"]:
-            logger.error(f"❌ 인스턴스가 {state} 상태로 전환됨")
+            logger.error(f"[FAIL] 인스턴스가 {state} 상태로 전환됨")
             return False
         time.sleep(interval)
-    logger.warning(f"⏰ 타임아웃: 목표 {target_states}, 현재 {state}")
+    logger.warning(f"[TIMEOUT] 타임아웃: 목표 {target_states}, 현재 {state}")
     return False
 
 def resize_instance(compute_client, instance_id, target_ocpus, target_memory):
     """인스턴스 정지 → 형상 변경 → 시작 → RUNNING 대기"""
-    logger.info(f"🔄 인스턴스 {instance_id} 확장: {target_ocpus} OCPU / {target_memory}GB")
+    logger.info(f"[RESIZE] 인스턴스 {instance_id} 확장: {target_ocpus} OCPU / {target_memory}GB")
 
     logger.info("  정지 요청...")
     compute_client.instance_action(instance_id, "STOP")
@@ -124,7 +124,7 @@ def resize_instance(compute_client, instance_id, target_ocpus, target_memory):
         logger.error("시작 실패")
         return False
 
-    logger.info("✅ 확장 완료")
+    logger.info("[OK] 확장 완료")
     return True
 
 def get_public_ip(compute_client, compartment_id, instance_id):
@@ -221,7 +221,7 @@ def main():
             attempt += 1
             wait_sec = get_wait_seconds()
             now_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S')
-            logger.info(f"[{now_str}] 🚀 [직접] 생성 시도 #{attempt} (다음 대기: {wait_sec}초)")
+            logger.info(f"[{now_str}] [LAUNCH] [직접] 생성 시도 #{attempt} (다음 대기: {wait_sec}초)")
             with stats_lock:
                 stats["direct_attempts"] += 1
 
@@ -230,9 +230,9 @@ def main():
                 response = client.launch_instance(details_direct)
                 instance_id = response.data.id
                 track(instance_id)
-                logger.info(f"✅ [직접] 생성 성공! OCID: {instance_id}")
+                logger.info(f"[OK] [직접] 생성 성공! OCID: {instance_id}")
 
-                logger.info("⏳ [직접] RUNNING 상태 대기 중 (최대 15분)...")
+                logger.info("[WAIT] [직접] RUNNING 상태 대기 중 (최대 15분)...")
                 success, final_state, state_log = wait_for_instance_running(client, instance_id)
                 if success:
                     with winner_lock:
@@ -310,16 +310,16 @@ def main():
             attempt += 1
             wait_sec = get_wait_seconds()
             now_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S')
-            logger.info(f"[{now_str}] 🚀 [소형] 생성 시도 #{attempt} (다음 대기: {wait_sec}초)")
+            logger.info(f"[{now_str}] [LAUNCH] [소형] 생성 시도 #{attempt} (다음 대기: {wait_sec}초)")
 
             instance_id = None
             try:
                 response = client.launch_instance(details_small)
                 instance_id = response.data.id
                 track(instance_id)
-                logger.info(f"✅ [소형] 1/6 생성 성공! OCID: {instance_id}")
+                logger.info(f"[OK] [소형] 1/6 생성 성공! OCID: {instance_id}")
 
-                logger.info("⏳ [소형] RUNNING 상태 대기 중 (최대 15분)...")
+                logger.info("[WAIT] [소형] RUNNING 상태 대기 중 (최대 15분)...")
                 success, final_state, state_log = wait_for_instance_running(client, instance_id)
                 if not success:
                     if final_state in ["TERMINATED", "TERMINATING"]:
@@ -467,7 +467,7 @@ def main():
             else:
                 next_report = now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=1)
             wait_seconds = (next_report - now).total_seconds()
-            logger.info(f"📊 다음 현황 보고: {next_report.strftime('%m/%d %H:%M')} KST ({wait_seconds/3600:.1f}시간 후)")
+            logger.info(f"[REPORT] 다음 현황 보고: {next_report.strftime('%m/%d %H:%M')} KST ({wait_seconds/3600:.1f}시간 후)")
             if done_event.wait(wait_seconds):
                 return
             with stats_lock:
@@ -496,7 +496,7 @@ def main():
     t_small.start()
     t_status.start()
 
-    logger.info("🚀 병렬 생성 시작: [직접 4/24] + [소형 1/6→확장]")
+    logger.info("[LAUNCH] 병렬 생성 시작: [직접 4/24] + [소형 1/6→확장]")
 
     # 완료 대기
     while not done_event.is_set():
@@ -514,12 +514,12 @@ def main():
         ssh_cmd = ""
         if public_ip:
             ssh_cmd = f"ssh -i /path/to/private_key opc@{public_ip}"
-            logger.info(f"\n🔗 인스턴스 접속 정보 ({strategy}):")
+            logger.info(f"\n[INFO] 인스턴스 접속 정보 ({strategy}):")
             logger.info(ssh_cmd)
             body = f"OCI ARM 인스턴스 생성 성공! ({strategy})\n\nOCID: {inst_id}\nPublic IP: {public_ip}\nSSH: {ssh_cmd}"
             send_email(f"[OCI ARM] 인스턴스 생성 성공! ({strategy})", body)
         else:
-            logger.warning("⚠️ 공인 IP를 찾을 수 없습니다.")
+            logger.warning("[WARN] 공인 IP를 찾을 수 없습니다.")
             body = f"OCI ARM 인스턴스 생성 성공! ({strategy})\n\nOCID: {inst_id}\n(공인 IP 없음)"
             send_email(f"[OCI ARM] 인스턴스 생성 성공 ({strategy}, IP 없음)", body)
 
