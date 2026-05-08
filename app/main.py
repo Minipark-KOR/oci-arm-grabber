@@ -10,7 +10,7 @@ import os
 import base64
 import smtplib
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 import pytz
 import threading
@@ -189,6 +189,9 @@ def main():
     winner_lock = threading.Lock()
     winner_info = {}
 
+    stats = {"small_ok": 0, "resize_fail": 0, "direct_attempts": 0}
+    stats_lock = threading.Lock()
+
     def run_direct():
         """직접 4/24 생성 전략"""
         nonlocal winner_info
@@ -199,6 +202,8 @@ def main():
             wait_sec = get_wait_seconds()
             now_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S')
             logger.info(f"[{now_str}] 🚀 [직접] 생성 시도 #{attempt} (다음 대기: {wait_sec}초)")
+            with stats_lock:
+                stats["direct_attempts"] += 1
 
             try:
                 response = client.launch_instance(details_direct)
@@ -273,6 +278,8 @@ def main():
             try:
                 response = client.launch_instance(details_small)
                 instance_id = response.data.id
+                with stats_lock:
+                    stats["small_ok"] += 1
                 logger.info(f"✅ [소형] 1/6 생성 성공! OCID: {instance_id}")
 
                 logger.info("⏳ [소형] RUNNING 상태 대기 중 (최대 15분)...")
@@ -325,6 +332,8 @@ def main():
                     if resize_instance(client, instance_id, 4, 24):
                         resize_ok = True
                         break
+                    with stats_lock:
+                        stats["resize_fail"] += 1
                     if resize_attempt < 4:
                         logger.info("[소형] 확장 실패, 60초 후 재시도...")
                         if done_event.wait(60):
@@ -367,10 +376,40 @@ def main():
                 time.sleep(wait_sec)
                 continue
 
+    def status_reporter():
+        """오전 9시 / 저녁 9시 (KST) 기준 현황 메일 발송"""
+        kst = pytz.timezone('Asia/Seoul')
+        while not done_event.is_set():
+            now = datetime.now(kst)
+            # 다음 보고 시간 계산
+            if now.hour < 9:
+                next_report = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            elif now.hour < 21:
+                next_report = now.replace(hour=21, minute=0, second=0, microsecond=0)
+            else:
+                next_report = now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            wait_seconds = (next_report - now).total_seconds()
+            logger.info(f"📊 다음 현황 보고: {next_report.strftime('%m/%d %H:%M')} KST ({wait_seconds/3600:.1f}시간 후)")
+            if done_event.wait(wait_seconds):
+                return
+            with stats_lock:
+                body = (
+                    f"OCI ARM 생성 현황 ({next_report.strftime('%Y-%m-%d %H:%M')} KST 기준)\n\n"
+                    f"1/6 launch 성공: {stats['small_ok']}회\n"
+                    f"resize 실패: {stats['resize_fail']}회\n"
+                    f"4/24 직접 시도: {stats['direct_attempts']}회"
+                )
+                stats["small_ok"] = 0
+                stats["resize_fail"] = 0
+                stats["direct_attempts"] = 0
+            send_email("[OCI ARM] 12시간 현황", body)
+
     t_direct = threading.Thread(target=run_direct, daemon=True, name="direct")
     t_small = threading.Thread(target=run_small, daemon=True, name="small")
+    t_status = threading.Thread(target=status_reporter, daemon=True, name="status")
     t_direct.start()
     t_small.start()
+    t_status.start()
 
     logger.info("🚀 병렬 생성 시작: [직접 4/24] + [소형 1/6→확장]")
 
