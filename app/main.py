@@ -76,6 +76,7 @@ def wait_for_instance_running(compute_client, instance_id, timeout=900, interval
 def wait_for_state(compute_client, instance_id, target_states, timeout=300, interval=10):
     """인스턴스가 지정된 상태 중 하나에 도달할 때까지 대기 (TERMINATED/TERMINATING 시 즉시 False)"""
     start_time = time.time()
+    state = "UNKNOWN"
     while time.time() - start_time < timeout:
         instance = compute_client.get_instance(instance_id).data
         state = instance.lifecycle_state
@@ -111,6 +112,7 @@ def resize_instance(compute_client, instance_id, target_ocpus, target_memory):
     except oci.exceptions.ServiceError as e:
         logger.error(f"형상 업데이트 실패: {e}")
         compute_client.instance_action(instance_id, "START")
+        wait_for_state(compute_client, instance_id, ["RUNNING"], timeout=120)
         return False
 
     logger.info("  시작 요청...")
@@ -123,16 +125,20 @@ def resize_instance(compute_client, instance_id, target_ocpus, target_memory):
     return True
 
 def get_public_ip(compute_client, compartment_id, instance_id):
-    vnic_attachments = compute_client.list_vnic_attachments(
-        compartment_id=compartment_id,
-        instance_id=instance_id
-    ).data
-    if not vnic_attachments:
+    try:
+        vnic_attachments = compute_client.list_vnic_attachments(
+            compartment_id=compartment_id,
+            instance_id=instance_id
+        ).data
+        if not vnic_attachments:
+            return None
+        vnic_id = vnic_attachments[0].vnic_id
+        network_client = oci.core.VirtualNetworkClient(compute_client.config)
+        vnic = network_client.get_vnic(vnic_id).data
+        return vnic.public_ip
+    except Exception as e:
+        logger.error(f"공인 IP 조회 실패: {e}")
         return None
-    vnic_id = vnic_attachments[0].vnic_id
-    network_client = oci.core.VirtualNetworkClient(compute_client.config)
-    vnic = network_client.get_vnic(vnic_id).data
-    return vnic.public_ip
 
 def main():
     # 환경 변수에서 필수 정보 읽기 (Docker 환경에 적합)
@@ -278,8 +284,6 @@ def main():
             try:
                 response = client.launch_instance(details_small)
                 instance_id = response.data.id
-                with stats_lock:
-                    stats["small_ok"] += 1
                 logger.info(f"✅ [소형] 1/6 생성 성공! OCID: {instance_id}")
 
                 logger.info("⏳ [소형] RUNNING 상태 대기 중 (최대 15분)...")
@@ -310,7 +314,11 @@ def main():
                     time.sleep(wait_sec)
                     continue
 
-                # 1/6 RUNNING → 확장 시도
+                # 1/6 RUNNING → 카운트
+                with stats_lock:
+                    stats["small_ok"] += 1
+
+                # 확장 시도
                 if done_event.is_set():
                     logger.info("[소형] 다른 전략이 이미 성공, 정리합니다.")
                     try:
