@@ -13,6 +13,7 @@ import logging
 from datetime import datetime
 from email.mime.text import MIMEText
 import pytz
+import threading
 
 # 로깅 설정
 logging.basicConfig(
@@ -72,6 +73,55 @@ def wait_for_instance_running(compute_client, instance_id, timeout=900, interval
     logger.warning(f"⏰ 시간 초과 (15분): 최종 상태 = {last_state}")
     return (False, last_state, state_log)
 
+def wait_for_state(compute_client, instance_id, target_states, timeout=300, interval=10):
+    """인스턴스가 지정된 상태 중 하나에 도달할 때까지 대기 (TERMINATED/TERMINATING 시 즉시 False)"""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        instance = compute_client.get_instance(instance_id).data
+        state = instance.lifecycle_state
+        logger.info(f"  상태: {state} (목표: {target_states})")
+        if state in target_states:
+            return True
+        if state in ["TERMINATED", "TERMINATING"]:
+            logger.error(f"❌ 인스턴스가 {state} 상태로 전환됨")
+            return False
+        time.sleep(interval)
+    logger.warning(f"⏰ 타임아웃: 목표 {target_states}, 현재 {state}")
+    return False
+
+def resize_instance(compute_client, instance_id, target_ocpus, target_memory):
+    """인스턴스 정지 → 형상 변경 → 시작 → RUNNING 대기"""
+    logger.info(f"🔄 인스턴스 {instance_id} 확장: {target_ocpus} OCPU / {target_memory}GB")
+
+    logger.info("  정지 요청...")
+    compute_client.instance_action(instance_id, "STOP")
+    if not wait_for_state(compute_client, instance_id, ["STOPPED"], timeout=300):
+        logger.error("정지 실패")
+        return False
+
+    logger.info("  형상 업데이트...")
+    try:
+        update_details = oci.core.models.UpdateInstanceDetails(
+            shape_config=oci.core.models.UpdateInstanceShapeConfigDetails(
+                ocpus=target_ocpus,
+                memory_in_gbs=target_memory
+            )
+        )
+        compute_client.update_instance(instance_id, update_details)
+    except oci.exceptions.ServiceError as e:
+        logger.error(f"형상 업데이트 실패: {e}")
+        compute_client.instance_action(instance_id, "START")
+        return False
+
+    logger.info("  시작 요청...")
+    compute_client.instance_action(instance_id, "START")
+    if not wait_for_state(compute_client, instance_id, ["RUNNING"], timeout=300):
+        logger.error("시작 실패")
+        return False
+
+    logger.info("✅ 확장 완료")
+    return True
+
 def get_public_ip(compute_client, compartment_id, instance_id):
     vnic_attachments = compute_client.list_vnic_attachments(
         compartment_id=compartment_id,
@@ -112,91 +162,246 @@ def main():
         "key_file": key_path,
         "fingerprint": os.environ.get("OCI_FINGERPRINT")
     }
-    compute_client = oci.core.ComputeClient(config)
 
-    instance_details = oci.core.models.LaunchInstanceDetails(
+    # 공통 인스턴스 상세 (shape 제외)
+    base_details = dict(
         compartment_id=compartment_id,
         availability_domain=availability_domain,
         display_name="devforge",
         shape="VM.Standard.A1.Flex",
-        shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=4, memory_in_gbs=24),
         source_details=oci.core.models.InstanceSourceViaImageDetails(image_id=image_id, boot_volume_size_in_gbs=50),
         subnet_id=subnet_id,
         metadata={"ssh_authorized_keys": ssh_public_key}
     )
 
-    attempt = 0
-    while True:
-        attempt += 1
-        wait_sec = get_wait_seconds()
-        now_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(f"[{now_str}] 🚀 생성 시도 #{attempt} (다음 대기: {wait_sec}초)")
+    # 직접 생성 (4 OCPU / 24GB)
+    details_direct = oci.core.models.LaunchInstanceDetails(
+        shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=4, memory_in_gbs=24),
+        **base_details
+    )
+    # 소형 선점 (1 OCPU / 6GB → 확장)
+    details_small = oci.core.models.LaunchInstanceDetails(
+        shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=1, memory_in_gbs=6),
+        **base_details
+    )
 
-        try:
-            response = compute_client.launch_instance(instance_details)
-            instance_id = response.data.id
-            logger.info(f"✅ 생성 성공! OCID: {instance_id}")
-            logger.info(f"현재 상태: {response.data.lifecycle_state}")
+    done_event = threading.Event()
+    winner_lock = threading.Lock()
+    winner_info = {}
 
-            logger.info("⏳ RUNNING 상태 대기 중 (최대 15분)...")
-            success, final_state, state_log = wait_for_instance_running(compute_client, instance_id)
-            if success:
-                public_ip = get_public_ip(compute_client, compartment_id, instance_id)
-                ssh_cmd = ""
-                if public_ip:
-                    ssh_cmd = f"ssh -i /path/to/private_key opc@{public_ip}"
-                    logger.info(f"\n🔗 인스턴스 접속 정보:")
-                    logger.info(ssh_cmd)
-                    body = f"OCI ARM 인스턴스 생성 성공!\n\nOCID: {instance_id}\nPublic IP: {public_ip}\nSSH: {ssh_cmd}"
-                    send_email("[OCI ARM] 인스턴스 생성 성공!", body)
+    def run_direct():
+        """직접 4/24 생성 전략"""
+        nonlocal winner_info
+        client = oci.core.ComputeClient(config)
+        attempt = 0
+        while not done_event.is_set():
+            attempt += 1
+            wait_sec = get_wait_seconds()
+            now_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S')
+            logger.info(f"[{now_str}] 🚀 [직접] 생성 시도 #{attempt} (다음 대기: {wait_sec}초)")
+
+            try:
+                response = client.launch_instance(details_direct)
+                instance_id = response.data.id
+                logger.info(f"✅ [직접] 생성 성공! OCID: {instance_id}")
+
+                logger.info("⏳ [직접] RUNNING 상태 대기 중 (최대 15분)...")
+                success, final_state, state_log = wait_for_instance_running(client, instance_id)
+                if success:
+                    with winner_lock:
+                        if not done_event.is_set():
+                            done_event.set()
+                            winner_info = {"strategy": "직접", "instance_id": instance_id, "client": client}
+                            return
+                    # 패배: 이미 다른 쪽이 성공
+                    logger.info("[직접] 다른 전략이 이미 성공, 정리합니다.")
+                    try:
+                        client.terminate_instance(instance_id)
+                    except Exception:
+                        pass
+                    return
+                elif final_state in ["TERMINATED", "TERMINATING"]:
+                    logger.warning(f"[직접] {final_state} 상태, 종료 후 재시도...")
+                    try:
+                        client.terminate_instance(instance_id)
+                    except Exception:
+                        pass
+                    now_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S')
+                    body = (
+                        f"[직접 전략] OCI ARM 인스턴스 생성 실패\n\n"
+                        f"시간: {now_str} (KST)\n"
+                        f"OCID: {instance_id}\n"
+                        f"최종 상태: {final_state}\n\n"
+                        f"상태 변화 로그:\n"
+                        + "\n".join(state_log)
+                    )
+                    send_email("[OCI ARM] 생성 실패 - TERMINATED (직접)", body)
+                    time.sleep(wait_sec)
+                    continue
                 else:
-                    logger.warning("⚠️ 공인 IP를 찾을 수 없습니다.")
-                    body = f"OCI ARM 인스턴스 생성 성공!\n\nOCID: {instance_id}\n(공인 IP 없음)"
-                    send_email("[OCI ARM] 인스턴스 생성 성공 (IP 없음)", body)
-                logger.info("작업 완료. 컨테이너 유지 중...")
-                while True:
-                    time.sleep(3600)
-            elif final_state in ["TERMINATED", "TERMINATING"]:
-                logger.warning(f"⚠️ 인스턴스가 {final_state} 상태, 종료 처리합니다.")
-                try:
-                    compute_client.terminate_instance(instance_id)
-                except Exception as e:
-                    logger.warning(f"종료 요청 중 오류 (무시): {e}")
-                now_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S')
-                body = (
-                    f"OCI ARM 인스턴스 생성 실패\n\n"
-                    f"시간: {now_str} (KST)\n"
-                    f"OCID: {instance_id}\n"
-                    f"최종 상태: {final_state}\n\n"
-                    f"상태 변화 로그:\n"
-                    + "\n".join(state_log)
-                )
-                send_email("[OCI ARM] 생성 실패 - TERMINATED", body)
-                logger.info(f"재시도 대기 ({wait_sec}초)...")
+                    logger.warning(f"[직접] 시간 초과 (현재 상태: {final_state}), 정리 후 재시도...")
+                    try:
+                        client.terminate_instance(instance_id)
+                    except Exception:
+                        pass
+                    time.sleep(wait_sec)
+                    continue
+
+            except oci.exceptions.ServiceError as e:
+                if "Out of" in str(e) or e.status == 429:
+                    logger.warning(f"[직접] 용량 부족 또는 제한")
+                else:
+                    logger.error(f"[직접] OCI 오류: {e}")
                 time.sleep(wait_sec)
                 continue
-            else:
-                logger.warning(f"⏰ 시간 초과 (현재 상태: {final_state}), 인스턴스 정리 후 재시도합니다...")
-                try:
-                    compute_client.terminate_instance(instance_id)
-                except Exception:
-                    pass
+            except Exception as e:
+                logger.error(f"[직접] 기타 오류: {e}, 재시도...")
                 time.sleep(wait_sec)
                 continue
 
-        except oci.exceptions.ServiceError as e:
-            if "Out of" in str(e) or e.status == 429:
-                logger.warning(f"⚠️ 용량 부족 또는 제한: {e}")
+    def run_small():
+        """소형 1/6 생성 → 확장 전략"""
+        nonlocal winner_info
+        client = oci.core.ComputeClient(config)
+        attempt = 0
+        while not done_event.is_set():
+            attempt += 1
+            wait_sec = get_wait_seconds()
+            now_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S')
+            logger.info(f"[{now_str}] 🚀 [소형] 생성 시도 #{attempt} (다음 대기: {wait_sec}초)")
+
+            try:
+                response = client.launch_instance(details_small)
+                instance_id = response.data.id
+                logger.info(f"✅ [소형] 1/6 생성 성공! OCID: {instance_id}")
+
+                logger.info("⏳ [소형] RUNNING 상태 대기 중 (최대 15분)...")
+                success, final_state, state_log = wait_for_instance_running(client, instance_id)
+                if not success:
+                    if final_state in ["TERMINATED", "TERMINATING"]:
+                        logger.warning(f"[소형] {final_state} 상태, 종료 후 재시도...")
+                        try:
+                            client.terminate_instance(instance_id)
+                        except Exception:
+                            pass
+                        now_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S')
+                        body = (
+                            f"[소형 전략] OCI ARM 인스턴스 생성 실패\n\n"
+                            f"시간: {now_str} (KST)\n"
+                            f"OCID: {instance_id}\n"
+                            f"최종 상태: {final_state}\n\n"
+                            f"상태 변화 로그:\n"
+                            + "\n".join(state_log)
+                        )
+                        send_email("[OCI ARM] 생성 실패 - TERMINATED (소형)", body)
+                    else:
+                        logger.warning(f"[소형] 시간 초과 (현재 상태: {final_state}), 정리 후 재시도...")
+                        try:
+                            client.terminate_instance(instance_id)
+                        except Exception:
+                            pass
+                    time.sleep(wait_sec)
+                    continue
+
+                # 1/6 RUNNING → 확장 시도
+                if done_event.is_set():
+                    logger.info("[소형] 다른 전략이 이미 성공, 정리합니다.")
+                    try:
+                        client.terminate_instance(instance_id)
+                    except Exception:
+                        pass
+                    return
+
+                # RESIZE 재시도 (최대 5회, 60초 간격)
+                resize_ok = False
+                for resize_attempt in range(5):
+                    if done_event.is_set():
+                        try:
+                            client.terminate_instance(instance_id)
+                        except Exception:
+                            pass
+                        return
+                    logger.info(f"[소형] 확장 시도 {resize_attempt + 1}/5")
+                    if resize_instance(client, instance_id, 4, 24):
+                        resize_ok = True
+                        break
+                    if resize_attempt < 4:
+                        logger.info("[소형] 확장 실패, 60초 후 재시도...")
+                        if done_event.wait(60):
+                            try:
+                                client.terminate_instance(instance_id)
+                            except Exception:
+                                pass
+                            return
+
+                if resize_ok:
+                    with winner_lock:
+                        if not done_event.is_set():
+                            done_event.set()
+                            winner_info = {"strategy": "소형→확장", "instance_id": instance_id, "client": client}
+                            return
+                    logger.info("[소형→확장] 다른 전략이 이미 성공, 정리합니다.")
+                    try:
+                        client.terminate_instance(instance_id)
+                    except Exception:
+                        pass
+                    return
+                else:
+                    logger.warning("[소형] 5회 확장 실패, 1/6 인스턴스 정리 후 재시도...")
+                    try:
+                        client.terminate_instance(instance_id)
+                    except Exception:
+                        pass
+                    time.sleep(wait_sec)
+                    continue
+
+            except oci.exceptions.ServiceError as e:
+                if "Out of" in str(e) or e.status == 429:
+                    logger.warning(f"[소형] 용량 부족 또는 제한")
+                else:
+                    logger.error(f"[소형] OCI 오류: {e}")
                 time.sleep(wait_sec)
                 continue
-            else:
-                logger.error(f"❌ OCI 오류, 재시도: {e}")
+            except Exception as e:
+                logger.error(f"[소형] 기타 오류: {e}, 재시도...")
                 time.sleep(wait_sec)
                 continue
-        except Exception as e:
-            logger.error(f"❌ 기타 오류: {e}, 재시도...")
-            time.sleep(wait_sec)
-            continue
+
+    t_direct = threading.Thread(target=run_direct, daemon=True, name="direct")
+    t_small = threading.Thread(target=run_small, daemon=True, name="small")
+    t_direct.start()
+    t_small.start()
+
+    logger.info("🚀 병렬 생성 시작: [직접 4/24] + [소형 1/6→확장]")
+
+    # 완료 대기
+    while not done_event.is_set():
+        t_direct.join(timeout=1)
+        t_small.join(timeout=1)
+        if not t_direct.is_alive() and not t_small.is_alive():
+            logger.error("양쪽 스레드 모두 종료됨")
+            break
+
+    if winner_info:
+        inst_id = winner_info["instance_id"]
+        strategy = winner_info["strategy"]
+        client = winner_info["client"]
+        public_ip = get_public_ip(client, compartment_id, inst_id)
+        ssh_cmd = ""
+        if public_ip:
+            ssh_cmd = f"ssh -i /path/to/private_key opc@{public_ip}"
+            logger.info(f"\n🔗 인스턴스 접속 정보 ({strategy}):")
+            logger.info(ssh_cmd)
+            body = f"OCI ARM 인스턴스 생성 성공! ({strategy})\n\nOCID: {inst_id}\nPublic IP: {public_ip}\nSSH: {ssh_cmd}"
+            send_email(f"[OCI ARM] 인스턴스 생성 성공! ({strategy})", body)
+        else:
+            logger.warning("⚠️ 공인 IP를 찾을 수 없습니다.")
+            body = f"OCI ARM 인스턴스 생성 성공! ({strategy})\n\nOCID: {inst_id}\n(공인 IP 없음)"
+            send_email(f"[OCI ARM] 인스턴스 생성 성공 ({strategy}, IP 없음)", body)
+
+    logger.info("작업 완료. 컨테이너 유지 중...")
+    while True:
+        time.sleep(3600)
 
 if __name__ == "__main__":
     main()
