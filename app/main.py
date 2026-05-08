@@ -376,6 +376,22 @@ def main():
                 time.sleep(wait_sec)
                 continue
 
+    def check_orphans():
+        """종료되지 않은 인스턴스 (고아) 목록 반환"""
+        client = oci.core.ComputeClient(config)
+        try:
+            instances = client.list_instances(
+                compartment_id=compartment_id,
+                lifecycle_state="RUNNING,PROVISIONING,STARTING,STOPPING,STOPPED"
+            ).data
+            result = []
+            for inst in instances:
+                result.append(f"  - {inst.id} [{inst.lifecycle_state}] {inst.display_name}")
+            return result
+        except Exception as e:
+            logger.error(f"고아 확인 중 오류: {e}")
+            return None
+
     def status_reporter():
         """오전 9시 / 저녁 9시 (KST) 기준 현황 메일 발송"""
         kst = pytz.timezone('Asia/Seoul')
@@ -397,11 +413,18 @@ def main():
                     f"OCI ARM 생성 현황 ({next_report.strftime('%Y-%m-%d %H:%M')} KST 기준)\n\n"
                     f"1/6 launch 성공: {stats['small_ok']}회\n"
                     f"resize 실패: {stats['resize_fail']}회\n"
-                    f"4/24 직접 시도: {stats['direct_attempts']}회"
+                    f"4/24 직접 시도: {stats['direct_attempts']}회\n"
                 )
                 stats["small_ok"] = 0
                 stats["resize_fail"] = 0
                 stats["direct_attempts"] = 0
+            orphans = check_orphans()
+            if orphans is None:
+                body += "\n고아 인스턴스: 확인 실패"
+            elif orphans:
+                body += f"\n고아 인스턴스: {len(orphans)}개\n" + "\n".join(orphans)
+            else:
+                body += "\n고아 인스턴스: 0개"
             send_email("[OCI ARM] 12시간 현황", body)
 
     t_direct = threading.Thread(target=run_direct, daemon=True, name="direct")
