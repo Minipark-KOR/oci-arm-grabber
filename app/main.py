@@ -201,6 +201,17 @@ def main():
     stats = {"small_ok": 0, "resize_fail": 0, "direct_attempts": 0}
     stats_lock = threading.Lock()
 
+    active_instances = set()
+    active_lock = threading.Lock()
+
+    def track(instance_id):
+        with active_lock:
+            active_instances.add(instance_id)
+
+    def untrack(instance_id):
+        with active_lock:
+            active_instances.discard(instance_id)
+
     def run_direct():
         """직접 4/24 생성 전략"""
         nonlocal winner_info
@@ -218,6 +229,7 @@ def main():
             try:
                 response = client.launch_instance(details_direct)
                 instance_id = response.data.id
+                track(instance_id)
                 logger.info(f"✅ [직접] 생성 성공! OCID: {instance_id}")
 
                 logger.info("⏳ [직접] RUNNING 상태 대기 중 (최대 15분)...")
@@ -230,6 +242,7 @@ def main():
                             return
                     # 패배: 이미 다른 쪽이 성공
                     logger.info("[직접] 다른 전략이 이미 성공, 정리합니다.")
+                    untrack(instance_id)
                     try:
                         client.terminate_instance(instance_id)
                     except Exception:
@@ -237,6 +250,7 @@ def main():
                     return
                 elif final_state in ["TERMINATED", "TERMINATING"]:
                     logger.warning(f"[직접] {final_state} 상태, 종료 후 재시도...")
+                    untrack(instance_id)
                     try:
                         client.terminate_instance(instance_id)
                     except Exception:
@@ -255,6 +269,7 @@ def main():
                     continue
                 else:
                     logger.warning(f"[직접] 시간 초과 (현재 상태: {final_state}), 정리 후 재시도...")
+                    untrack(instance_id)
                     try:
                         client.terminate_instance(instance_id)
                     except Exception:
@@ -268,6 +283,7 @@ def main():
                 else:
                     logger.error(f"[직접] OCI 오류: {e}")
                 if instance_id:
+                    untrack(instance_id)
                     try:
                         client.terminate_instance(instance_id)
                     except Exception:
@@ -277,6 +293,7 @@ def main():
             except Exception as e:
                 logger.error(f"[직접] 기타 오류: {e}, 재시도...")
                 if instance_id:
+                    untrack(instance_id)
                     try:
                         client.terminate_instance(instance_id)
                     except Exception:
@@ -299,6 +316,7 @@ def main():
             try:
                 response = client.launch_instance(details_small)
                 instance_id = response.data.id
+                track(instance_id)
                 logger.info(f"✅ [소형] 1/6 생성 성공! OCID: {instance_id}")
 
                 logger.info("⏳ [소형] RUNNING 상태 대기 중 (최대 15분)...")
@@ -306,6 +324,7 @@ def main():
                 if not success:
                     if final_state in ["TERMINATED", "TERMINATING"]:
                         logger.warning(f"[소형] {final_state} 상태, 종료 후 재시도...")
+                        untrack(instance_id)
                         try:
                             client.terminate_instance(instance_id)
                         except Exception:
@@ -322,6 +341,7 @@ def main():
                         send_email("[OCI ARM] 생성 실패 - TERMINATED (소형)", body)
                     else:
                         logger.warning(f"[소형] 시간 초과 (현재 상태: {final_state}), 정리 후 재시도...")
+                        untrack(instance_id)
                         try:
                             client.terminate_instance(instance_id)
                         except Exception:
@@ -336,6 +356,7 @@ def main():
                 # 확장 시도
                 if done_event.is_set():
                     logger.info("[소형] 다른 전략이 이미 성공, 정리합니다.")
+                    untrack(instance_id)
                     try:
                         client.terminate_instance(instance_id)
                     except Exception:
@@ -346,6 +367,7 @@ def main():
                 resize_ok = False
                 for resize_attempt in range(5):
                     if done_event.is_set():
+                        untrack(instance_id)
                         try:
                             client.terminate_instance(instance_id)
                         except Exception:
@@ -360,6 +382,7 @@ def main():
                     if resize_attempt < 4:
                         logger.info("[소형] 확장 실패, 60초 후 재시도...")
                         if done_event.wait(60):
+                            untrack(instance_id)
                             try:
                                 client.terminate_instance(instance_id)
                             except Exception:
@@ -373,6 +396,7 @@ def main():
                             winner_info = {"strategy": "소형→확장", "instance_id": instance_id, "client": client}
                             return
                     logger.info("[소형→확장] 다른 전략이 이미 성공, 정리합니다.")
+                    untrack(instance_id)
                     try:
                         client.terminate_instance(instance_id)
                     except Exception:
@@ -380,6 +404,7 @@ def main():
                     return
                 else:
                     logger.warning("[소형] 5회 확장 실패, 1/6 인스턴스 정리 후 재시도...")
+                    untrack(instance_id)
                     try:
                         client.terminate_instance(instance_id)
                     except Exception:
@@ -393,6 +418,7 @@ def main():
                 else:
                     logger.error(f"[소형] OCI 오류: {e}")
                 if instance_id:
+                    untrack(instance_id)
                     try:
                         client.terminate_instance(instance_id)
                     except Exception:
@@ -402,6 +428,7 @@ def main():
             except Exception as e:
                 logger.error(f"[소형] 기타 오류: {e}, 재시도...")
                 if instance_id:
+                    untrack(instance_id)
                     try:
                         client.terminate_instance(instance_id)
                     except Exception:
@@ -417,6 +444,9 @@ def main():
             active_states = {"MOVING", "PROVISIONING", "RUNNING", "STARTING", "STOPPING", "STOPPED", "CREATING_IMAGE"}
             result = []
             for inst in instances:
+                with active_lock:
+                    if inst.id in active_instances:
+                        continue
                 if inst.lifecycle_state in active_states:
                     result.append(f"  - {inst.id} [{inst.lifecycle_state}] {inst.display_name}")
             return result
