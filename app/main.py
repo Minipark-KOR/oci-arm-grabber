@@ -47,21 +47,30 @@ def get_wait_seconds():
     hour = datetime.now(kst).hour
     return 30 if 0 <= hour < 6 else 300
 
-def wait_for_instance_running(compute_client, instance_id, timeout=300, interval=10):
+def wait_for_instance_running(compute_client, instance_id, timeout=900, interval=10):
     start_time = time.time()
+    last_state = None
+    state_log = []
+    last_log_at = 0
     while time.time() - start_time < timeout:
         instance = compute_client.get_instance(instance_id).data
         state = instance.lifecycle_state
-        logger.info(f"  상태: {state}")
+        elapsed = int(time.time() - start_time)
+        entry = f"[{elapsed}s] {state}"
+        if state != last_state or elapsed - last_log_at >= 60:
+            state_log.append(entry)
+            last_log_at = elapsed
+        logger.info(f"  {entry}")
+        last_state = state
         if state == "RUNNING":
             logger.info("✅ 인스턴스 실행 중")
-            return True
+            return (True, state, state_log)
         elif state in ["TERMINATED", "TERMINATING"]:
-            logger.error("❌ 인스턴스 종료됨")
-            return False
+            logger.error(f"❌ 인스턴스가 {state} 상태로 전환됨")
+            return (False, state, state_log)
         time.sleep(interval)
-    logger.warning("⏰ 시간 초과: RUNNING 상태 미도달")
-    return False
+    logger.warning(f"⏰ 시간 초과 (15분): 최종 상태 = {last_state}")
+    return (False, last_state, state_log)
 
 def get_public_ip(compute_client, compartment_id, instance_id):
     vnic_attachments = compute_client.list_vnic_attachments(
@@ -129,8 +138,9 @@ def main():
             logger.info(f"✅ 생성 성공! OCID: {instance_id}")
             logger.info(f"현재 상태: {response.data.lifecycle_state}")
 
-            logger.info("⏳ RUNNING 상태 대기 중 (최대 5분)...")
-            if wait_for_instance_running(compute_client, instance_id):
+            logger.info("⏳ RUNNING 상태 대기 중 (최대 15분)...")
+            success, final_state, state_log = wait_for_instance_running(compute_client, instance_id)
+            if success:
                 public_ip = get_public_ip(compute_client, compartment_id, instance_id)
                 ssh_cmd = ""
                 if public_ip:
@@ -143,13 +153,36 @@ def main():
                     logger.warning("⚠️ 공인 IP를 찾을 수 없습니다.")
                     body = f"OCI ARM 인스턴스 생성 성공!\n\nOCID: {instance_id}\n(공인 IP 없음)"
                     send_email("[OCI ARM] 인스턴스 생성 성공 (IP 없음)", body)
+                logger.info("작업 완료. 컨테이너 유지 중...")
+                while True:
+                    time.sleep(3600)
+            elif final_state in ["TERMINATED", "TERMINATING"]:
+                logger.warning(f"⚠️ 인스턴스가 {final_state} 상태, 종료 처리합니다.")
+                try:
+                    compute_client.terminate_instance(instance_id)
+                except Exception as e:
+                    logger.warning(f"종료 요청 중 오류 (무시): {e}")
+                now_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S')
+                body = (
+                    f"OCI ARM 인스턴스 생성 실패\n\n"
+                    f"시간: {now_str} (KST)\n"
+                    f"OCID: {instance_id}\n"
+                    f"최종 상태: {final_state}\n\n"
+                    f"상태 변화 로그:\n"
+                    + "\n".join(state_log)
+                )
+                send_email("[OCI ARM] 생성 실패 - TERMINATED", body)
+                logger.info(f"재시도 대기 ({wait_sec}초)...")
+                time.sleep(wait_sec)
+                continue
             else:
-                logger.warning("⚠️ RUNNING 상태 도달 실패, 인스턴스를 종료합니다.")
-                compute_client.terminate_instance(instance_id)
-                send_email("[OCI ARM] 생성 실패 - RUNNING 미도달", f"인스턴스가 생성되었으나 RUNNING 상태에 도달하지 못해 종료했습니다.\n\nOCID: {instance_id}")
-            logger.info("작업 완료. 컨테이너 유지 중...")
-            while True:
-                time.sleep(3600)
+                logger.warning(f"⏰ 시간 초과 (현재 상태: {final_state}), 인스턴스 정리 후 재시도합니다...")
+                try:
+                    compute_client.terminate_instance(instance_id)
+                except Exception:
+                    pass
+                time.sleep(wait_sec)
+                continue
 
         except oci.exceptions.ServiceError as e:
             if "Out of" in str(e) or e.status == 429:
